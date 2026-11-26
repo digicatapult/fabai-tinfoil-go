@@ -51,13 +51,14 @@ type gatewayPolicy struct {
 	pins       map[string]ModelPin
 	pinnedOnly bool
 	verifier   *verify.Verifier // for unpinned models
+	owner      string           // repository owner, ending in a slash
 }
 
 // errCallerAuthorizedConfig rejects a policy whose config the caller supplies
 // or authorizes: gateway replicas are verified against repository pins.
 var errCallerAuthorizedConfig = errors.New("caller-authorized config requires a direct enclave client")
 
-func newGatewayPolicy(modelPins map[string]ModelPin, pinnedOnly bool, v *verify.Verifier) (gatewayPolicy, error) {
+func newGatewayPolicy(modelPins map[string]ModelPin, pinnedOnly bool, v *verify.Verifier, owner string) (gatewayPolicy, error) {
 	if pinnedOnly && len(modelPins) == 0 {
 		return gatewayPolicy{}, fmt.Errorf("pinned-only mode requires at least one model pin")
 	}
@@ -70,13 +71,13 @@ func newGatewayPolicy(modelPins map[string]ModelPin, pinnedOnly bool, v *verify.
 	if v.CallerAuthorizesConfig() {
 		return gatewayPolicy{}, errCallerAuthorizedConfig
 	}
-	p := gatewayPolicy{pins: make(map[string]ModelPin), pinnedOnly: pinnedOnly, verifier: v}
+	p := gatewayPolicy{pins: make(map[string]ModelPin), pinnedOnly: pinnedOnly, verifier: v, owner: owner}
 	for model, pin := range modelPins {
 		if pin.Verifier != nil && pin.Verifier.CallerAuthorizesConfig() {
 			return gatewayPolicy{}, fmt.Errorf("model %q: %w", model, errCallerAuthorizedConfig)
 		}
-		if strings.TrimSpace(model) == "" || !strings.HasPrefix(pin.Repo, trustedRepoOwner) {
-			return gatewayPolicy{}, fmt.Errorf("model pin %q repository %q must belong to %s", model, pin.Repo, trustedRepoOwner)
+		if strings.TrimSpace(model) == "" || !strings.HasPrefix(pin.Repo, owner) {
+			return gatewayPolicy{}, fmt.Errorf("model pin %q repository %q must belong to %s", model, pin.Repo, owner)
 		}
 		if _, _, _, err := verify.ParseReference(pin.Repo); err != nil {
 			return gatewayPolicy{}, fmt.Errorf("model %q: %w", model, errs.Configuration(err))
@@ -92,8 +93,8 @@ func (p *gatewayPolicy) resolve(model string, catalog Catalog) ([]string, replic
 		return nil, replica{}, errs.Configuration(fmt.Errorf("model %q is not pinned", model))
 	}
 	entry := catalog[model]
-	if !entry.trusted() {
-		return nil, replica{}, errs.Configuration(fmt.Errorf("model %q has no valid bare %s repository with replicas in the gateway catalog", model, trustedRepoOwner))
+	if !entry.trustedFor(p.owner) {
+		return nil, replica{}, errs.Configuration(fmt.Errorf("model %q has no valid bare %s repository with replicas in the gateway catalog", model, p.owner))
 	}
 	if pinned {
 		if repo, _, _ := strings.Cut(pin.Repo, "@"); entry.Repo != repo {
@@ -138,30 +139,44 @@ type Config struct {
 	// UserCacheSecret is the explicit secret; empty selects the secret that
 	// is generated once per process.
 	UserCacheSecret string
+	// RepositoryOwner is the owner whose repositories the catalog and model
+	// pins may name, ending in a slash; empty selects tinfoilsh/.
+	RepositoryOwner string
+	// SealCheck, when set, verifies each replica in place of Verifier, for
+	// one request at a time (enclave.SealCheck).
+	SealCheck enclave.SealCheck
+	// Transport carries the catalog fetch and sealed requests; nil selects
+	// http.DefaultTransport.
+	Transport http.RoundTripper
+	// OmitCachePrefix sends no X-Tinfoil-Cache-Prefix, so the gateway sees
+	// nothing derived from the prompt; replicas are then ranked randomly.
+	OmitCachePrefix bool
 }
 
 // NewTransport copies the policy in c and does no network I/O: the catalog is
 // fetched and replicas are verified on first use.
 func NewTransport(c Config) (*Transport, error) {
-	policy, err := newGatewayPolicy(c.ModelPins, c.PinnedModelsOnly, c.Verifier)
+	owner := cmp.Or(c.RepositoryOwner, trustedRepoOwner)
+	policy, err := newGatewayPolicy(c.ModelPins, c.PinnedModelsOnly, c.Verifier, owner)
 	if err != nil {
 		return nil, errs.Configuration(err)
 	}
 	catalog := func(context.Context) (Catalog, error) { return c.Catalog(), nil }
 	if c.Catalog == nil {
-		catalog = (&catalogCache{fetch: func(ctx context.Context) (Catalog, error) { return FetchCatalog(ctx, c.Relay) }}).get
+		catalog = (&catalogCache{fetch: func(ctx context.Context) (Catalog, error) { return fetchCatalog(ctx, c.Transport, c.Relay, owner) }}).get
 	}
 	return &Transport{
-		catalog: catalog,
-		policy:  policy,
-		secret:  cachesecret.Resolve(c.UserCacheSecret),
+		catalog:         catalog,
+		policy:          policy,
+		secret:          cachesecret.Resolve(c.UserCacheSecret),
+		omitCachePrefix: c.OmitCachePrefix,
 		build: func(r replica) (*verifiedReplicaTransport, error) {
 			// Tinfoil owns model names in both namespaces.
-			e, err := enclave.New(enclave.Config{Host: r.host, Relay: c.Relay, Pin: verify.Pin{Repo: r.ref, Project: r.ref}, Verifier: policy.verifierFor(r), VerificationCheck: c.VerificationCheck})
+			e, err := enclave.New(enclave.Config{Host: r.host, Relay: c.Relay, Pin: verify.Pin{Repo: r.ref, Project: r.ref}, Verifier: policy.verifierFor(r), VerificationCheck: c.VerificationCheck, SealCheck: c.SealCheck})
 			if err != nil {
 				return nil, err
 			}
-			keyed := transport.WithEHBP(nil, e)
+			keyed := transport.WithEHBP(c.Transport, e)
 			return &verifiedReplicaTransport{
 				transport:      replicaChain(keyed, e.Host(), c.BaseURL),
 				verification:   keyed.Current,
@@ -187,6 +202,9 @@ type Transport struct {
 	enclaves sync.Map // replica to *verifiedReplicaTransport
 	mu       sync.Mutex
 	rerouted map[string]string // cache prefix to host
+
+	// omitCachePrefix keeps X-Tinfoil-Cache-Prefix off every request.
+	omitCachePrefix bool
 }
 
 func (t *Transport) enclave(r replica) (*verifiedReplicaTransport, error) {
@@ -359,6 +377,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	if err := t.prepare(req); err != nil {
 		return nil, err
+	}
+	if t.omitCachePrefix {
+		req.Header.Del(cachePrefixHeader)
 	}
 	model := req.Header.Get(modelHeader)
 	catalog, err := t.catalog(req.Context())
@@ -538,7 +559,7 @@ func (t *Transport) scopeCache(h http.Header, fields map[string]json.RawMessage,
 		return nil, fmt.Errorf("deriving the cache salt: %w", err)
 	}
 	h.Del(cachePrefixHeader)
-	if head := promptHead(fields); head != nil {
+	if head := promptHead(fields); head != nil && !t.omitCachePrefix {
 		key, err := hkdf.Key(sha256.New, []byte(secret), apiKey, cacheRouteDomainTag, sha256.Size)
 		if err != nil {
 			return nil, fmt.Errorf("deriving the cache prefix key: %w", err)

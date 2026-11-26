@@ -48,9 +48,33 @@ type GatewayOptions struct {
 	// is created and refreshes it every 10 seconds while the client is used; a
 	// failed refresh keeps the last catalog fetched.
 	Catalog func() Catalog
+
+	// The options below are FabAI's (gateway_fabai.go). Unset, the client
+	// behaves as upstream's.
+
+	// RepositoryOwner is the GitHub owner whose bare repositories the catalog
+	// and ModelPins may name; empty selects tinfoilsh.
+	RepositoryOwner string
+	// SealCheck, when set, checks each replica in place of Verifier, which
+	// must then be nil, as must VerificationCheck and every ModelPin's
+	// Verifier. Each request is sealed to the key of a check of its own:
+	// no verification is cached or shared, even between concurrent requests.
+	// Verifications the client reports carry only that key, with empty code,
+	// config and measurement facts.
+	SealCheck SealCheck
+	// Transport carries the catalog fetch and sealed requests, so that only
+	// this client trusts, for example, a private CA for the gateway; nil
+	// selects http.DefaultTransport. Without a SealCheck, attestation
+	// documents are still fetched over http.DefaultTransport.
+	Transport http.RoundTripper
+	// OmitCachePrefix sends no X-Tinfoil-Cache-Prefix header, an HMAC of the
+	// start of the prompt, so the gateway sees nothing derived from the
+	// prompt. Replicas of a model are then tried in a random order.
+	OmitCachePrefix bool
 }
 
-// ModelPin pins a model to tinfoilsh/name[@tag][@sha256:digest].
+// ModelPin pins a model to tinfoilsh/name[@tag][@sha256:digest], or to a
+// repository of GatewayOptions.RepositoryOwner.
 type ModelPin struct {
 	Repo string
 	// Verifier is the pin's policy: nil inherits GatewayOptions.Verifier;
@@ -107,6 +131,10 @@ func unverifiedGatewayHTTPClient(opts *GatewayOptions) (*GatewayHTTPClient, erro
 	if err != nil {
 		return nil, err
 	}
+	owner, err := checkFabAIOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	pins := make(map[string]gateway.ModelPin, len(opts.ModelPins))
 	for model, pin := range opts.ModelPins {
 		pins[model] = gateway.ModelPin{Repo: pin.Repo, Verifier: pin.Verifier}
@@ -120,6 +148,10 @@ func unverifiedGatewayHTTPClient(opts *GatewayOptions) (*GatewayHTTPClient, erro
 		Verifier:          opts.Verifier,
 		VerificationCheck: opts.VerificationCheck,
 		UserCacheSecret:   opts.UserCacheSecret,
+		RepositoryOwner:   owner,
+		SealCheck:         opts.SealCheck,
+		Transport:         opts.Transport,
+		OmitCachePrefix:   opts.OmitCachePrefix,
 	})
 	if err != nil {
 		return nil, err

@@ -19,6 +19,9 @@ type state struct {
 	roundTripper http.RoundTripper
 	// rejected is guarded by the Transport's mu.
 	rejected bool
+	// claimed, guarded by the Transport's mu, is set once a request has been
+	// sent under a single-use state, so no other request reuses it.
+	claimed bool
 }
 
 // valid is called with the Transport's mu held.
@@ -30,7 +33,7 @@ func (s *state) valid() bool {
 // only if the current one has expired or been invalidated. A nil error means
 // requests can be sent under it.
 func (t *Transport) EnsureVerified(ctx context.Context) (*verify.Verification, error) {
-	s, err := t.verified(ctx, false, (*enclave.Enclave).Verify)
+	s, err := t.verified(ctx, false, false, (*enclave.Enclave).Verify)
 	if err != nil {
 		return nil, err
 	}
@@ -39,7 +42,7 @@ func (t *Transport) EnsureVerified(ctx context.Context) (*verify.Verification, e
 
 // Reverify verifies again even if the current verification is still valid.
 func (t *Transport) Reverify(ctx context.Context) (*verify.Verification, error) {
-	s, err := t.verified(ctx, true, (*enclave.Enclave).Verify)
+	s, err := t.verified(ctx, true, false, (*enclave.Enclave).Verify)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +52,7 @@ func (t *Transport) Reverify(ctx context.Context) (*verify.Verification, error) 
 // VerifyOnce verifies like Reverify but doesn't retry a failed attempt, so a
 // caller trying several enclaves moves on quickly.
 func (t *Transport) VerifyOnce(ctx context.Context) (*verify.Verification, error) {
-	s, err := t.verified(ctx, true, (*enclave.Enclave).VerifyOnce)
+	s, err := t.verified(ctx, true, false, (*enclave.Enclave).VerifyOnce)
 	if err != nil {
 		return nil, err
 	}
@@ -70,14 +73,18 @@ func (t *Transport) Current() *verify.Verification {
 
 // verified returns a valid state, refreshing it first when force is set or
 // the current one is invalid. Concurrent callers share one refresh, including
-// its failure.
-func (t *Transport) verified(ctx context.Context, force bool, verify func(*enclave.Enclave) (*verify.Verification, error)) (*state, error) {
+// its failure. For a single-use enclave, a claimed state is invalid, and
+// claim claims the state returned, so each request sent gets a verification
+// of its own.
+func (t *Transport) verified(ctx context.Context, force, claim bool, verify func(*enclave.Enclave) (*verify.Verification, error)) (*state, error) {
+	single := t.enclave.SingleUse()
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		t.mu.Lock()
-		if s := t.current; s != nil && s.valid() && !force {
+		if s := t.current; s != nil && s.valid() && !force && !(single && s.claimed) {
+			s.claimed = s.claimed || (single && claim)
 			t.mu.Unlock()
 			return s, nil
 		}

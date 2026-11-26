@@ -21,7 +21,9 @@ import (
 // the first request or EnsureVerified verifies, and concurrent callers share
 // one verification. A key rejection invalidates the verification the request
 // was sent under and is reported through IsKeyRejection; replaying the
-// request is up to the caller.
+// request is up to the caller. For a single-use enclave (a SealCheck), each
+// request claims a verification of its own, so no two requests, concurrent or
+// replayed, are sent under one check.
 type Transport struct {
 	enclave *enclave.Enclave
 	mode    mode
@@ -67,7 +69,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		closeRequestBody(req)
 		return nil, err
 	}
-	s, err := t.verified(req.Context(), false, (*enclave.Enclave).Verify)
+	s, err := t.verified(req.Context(), false, true, (*enclave.Enclave).Verify)
 	if err != nil {
 		closeRequestBody(req)
 		return nil, err

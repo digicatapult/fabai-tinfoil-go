@@ -1,0 +1,109 @@
+# FabAI's CT for this fork. Upstream's "SDK Tests", "SDK Release" and
+# "SDK Mobile" workflows are disabled in the repository's settings: the
+# live tests need Tinfoil's API key and service, and the release builds an
+# iOS framework FabAI doesn't use. This runs the rest of what they run,
+# unchanged, plus the check that only FabAI's patches differ from the
+# pinned upstream tag.
+name: FabAI CI
+
+on:
+  push:
+    branches: ["fabai/**"]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  scope:
+    name: Diff from the pinned upstream tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Only FabAI's patches differ from upstream
+        run: scripts/check-fabai-diff.sh --upstream
+
+  test:
+    name: Local tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Format and vet
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+
+      - name: Test
+        run: go test -race -p 1 ./...
+
+  conformance:
+    name: Conformance fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Public and read-only, at the commit upstream's own workflow pins.
+      - name: Check out the shared fixtures
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: tinfoilsh/tinfoil-conformance
+          ref: ad1925002c4b04df7f8e7e8cd095559b8e5b5467
+          path: tinfoil-conformance
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet the conformance build
+        run: go vet -tags tinfoil_conformance ./...
+
+      - name: Run the shared v3 fixtures
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          suites=("$GITHUB_WORKSPACE"/tinfoil-conformance/vectors/v3/*/)
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "::error::no fixture suites under tinfoil-conformance/vectors/v3"
+            exit 1
+          fi
+          for d in "${suites[@]}"; do
+            echo "== $(basename "$d")"
+            # TestFixtures skips a directory without top-level fixtures.
+            fixtures=("$d"*.json)
+            if [ "${#fixtures[@]}" -eq 0 ]; then
+              echo "::error::no fixtures in vectors/v3/$(basename "$d")"
+              exit 1
+            fi
+            TINFOIL_CONFORMANCE_FIXTURES="$d" \
+              go test -count=1 -tags tinfoil_conformance -run TestFixtures ./verify/conformance/
+          done
+
+      - name: Run the full-verify vectors through the mobile binding
+        env:
+          TINFOIL_CONFORMANCE_VECTORS: ${{ github.workspace }}/tinfoil-conformance/vectors
+        run: go test -count=1 -tags tinfoil_conformance -run 'TestConformanceVectors|TestDangerousTestOnly' ./mobile/

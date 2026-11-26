@@ -1,5 +1,6 @@
 // Package verifyhook carries package verify's test constructor to the rest of
-// the module without exporting it. Use it through internal/verifytest.
+// the module without exporting it. Use it through internal/verifytest, except
+// in internal/enclave, which reports a SealCheck's key through it.
 package verifyhook
 
 import (

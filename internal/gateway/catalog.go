@@ -40,11 +40,17 @@ type Catalog map[string]CatalogEntry
 // FetchCatalog reads the catalog of the gateway at host, keeping only models
 // with replicas of a bare tinfoilsh/ repository, without a tag or digest.
 func FetchCatalog(ctx context.Context, host string) (Catalog, error) {
+	return fetchCatalog(ctx, nil, host, trustedRepoOwner)
+}
+
+// fetchCatalog is FetchCatalog over rt (nil for http.DefaultTransport),
+// keeping models of owner's repositories, where owner ends in a slash.
+func fetchCatalog(ctx context.Context, rt http.RoundTripper, host, owner string) (Catalog, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+catalogPath, nil)
 	if err != nil {
 		return nil, errs.Configuration(err)
 	}
-	resp, err := (&http.Client{Timeout: catalogFetchTimeout, CheckRedirect: fetch.RefuseInsecureRedirects}).Do(req)
+	resp, err := (&http.Client{Transport: rt, Timeout: catalogFetchTimeout, CheckRedirect: fetch.RefuseInsecureRedirects}).Do(req)
 	if err != nil {
 		return nil, errs.Network(err)
 	}
@@ -52,12 +58,16 @@ func FetchCatalog(ctx context.Context, host string) (Catalog, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, errs.Network(fmt.Errorf("fetching gateway catalog: %s", resp.Status))
 	}
-	return readCatalog(resp.Body)
+	return readCatalogFor(resp.Body, owner)
 }
 
 // readCatalog decodes at most maxCatalogBytes of an untrusted gateway's
 // catalog, so an oversized one can't exhaust memory.
 func readCatalog(r io.Reader) (Catalog, error) {
+	return readCatalogFor(r, trustedRepoOwner)
+}
+
+func readCatalogFor(r io.Reader, owner string) (Catalog, error) {
 	// LimitReader truncates silently. Reading one byte past the limit tells an
 	// oversized catalog apart from one of exactly the maximum size.
 	body, err := io.ReadAll(io.LimitReader(r, maxCatalogBytes+1))
@@ -71,13 +81,15 @@ func readCatalog(r io.Reader) (Catalog, error) {
 	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&catalog); err != nil {
 		return nil, errs.Network(fmt.Errorf("decoding gateway catalog: %w", err))
 	}
-	maps.DeleteFunc(catalog, func(_ string, entry CatalogEntry) bool { return !entry.trusted() })
+	maps.DeleteFunc(catalog, func(_ string, entry CatalogEntry) bool { return !entry.trustedFor(owner) })
 	return catalog, nil
 }
 
-func (e CatalogEntry) trusted() bool {
+// trustedFor reports a bare repository of owner, which ends in a slash, with
+// at least one replica.
+func (e CatalogEntry) trustedFor(owner string) bool {
 	repo, _, _, err := verify.ParseReference(e.Repo)
-	return err == nil && repo == e.Repo && strings.HasPrefix(repo, trustedRepoOwner) && len(e.Hosts) > 0
+	return err == nil && repo == e.Repo && strings.HasPrefix(repo, owner) && len(e.Hosts) > 0
 }
 
 // catalogCache fetches the catalog on first use and refreshes it on use once

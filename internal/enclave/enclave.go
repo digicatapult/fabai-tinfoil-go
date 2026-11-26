@@ -44,6 +44,9 @@ type Config struct {
 	// VerificationCheck, when set, is called with each verification that
 	// passes Verifier. An error rejects the verification without a retry.
 	VerificationCheck func(v *verify.Verification) error
+	// SealCheck, when set, replaces fetching and verifying the document:
+	// Pin and Verifier are then unused. See SealCheck.
+	SealCheck SealCheck
 }
 
 // Enclave is one enclave and the policy its attestation is verified against.
@@ -56,10 +59,15 @@ type Enclave struct {
 	check func(v *verify.Verification) error
 	// fetch, when set, replaces fetching and verifying a document, for tests.
 	fetch func() (*verify.Verification, error)
+	// sealCheck is the caller's SealCheck, or nil.
+	sealCheck SealCheck
 }
 
 // New checks c.Pin against the verifier's rules and does no network I/O.
 func New(c Config) (*Enclave, error) {
+	if c.SealCheck != nil {
+		return newSealChecked(c)
+	}
 	v := c.Verifier
 	if v == nil {
 		var err error
@@ -144,6 +152,9 @@ func (e *Enclave) verify(retries int) (*verify.Verification, error) {
 }
 
 func (e *Enclave) fetchVerification() (*verify.Verification, error) {
+	if e.sealCheck != nil {
+		return e.runSealCheck()
+	}
 	nonce, err := document.RandomNonce()
 	if err != nil {
 		return nil, err
